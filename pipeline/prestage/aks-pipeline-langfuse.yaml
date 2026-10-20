@@ -1,0 +1,62 @@
+trigger: none
+# Manual prestage pipeline. Azure DevOps must use this file as the pipeline YAML.
+
+parameters:
+  - name: buildImages
+    displayName: Build and push images
+    type: boolean
+    default: true
+  - name: deploy
+    displayName: Deploy to AKS
+    type: boolean
+    default: true
+
+# Builds langfuse-web and langfuse-worker, pushes them to the prestage ACR, then
+# renders deploy/prestg/langfuse.yaml with OneKey project langfuse-preuat and
+# applies it. ClickHouse, Postgres, Redis, and MinIO stay on the versions
+# written in that manifest.
+variables:
+  acrUrl: oneformaprestageacr.azurecr.io
+  srcDir: $(Build.SourcesDirectory)
+  DOCKER_BUILDKIT: 1
+
+stages:
+  - stage: "Build_And_Deploy"
+    pool:
+      name: oneforma-v2-pre-stage
+    displayName: "PRE UAT Deployment"
+    jobs:
+      - job: "Build_And_Deploy"
+        ${{ if and(eq(parameters.buildImages, true), eq(parameters.deploy, true)) }}:
+          displayName: "Build And Deploy"
+        ${{ elseif and(eq(parameters.buildImages, true), eq(parameters.deploy, false)) }}:
+          displayName: "Build"
+        ${{ elseif and(eq(parameters.buildImages, false), eq(parameters.deploy, true)) }}:
+          displayName: "Deploy"
+        ${{ else }}:
+          displayName: "Nothing selected"
+        timeoutInMinutes: 180
+        steps:
+          - ${{ if and(eq(parameters.buildImages, false), eq(parameters.deploy, false)) }}:
+            - script: |
+                echo "Select Build and push images, Deploy to AKS, or both."
+                exit 1
+              displayName: "Nothing selected"
+          - ${{ else }}:
+            - script: |
+                sudo rm -rf $(Agent.BuildDirectory)/*
+              displayName: 'Clean Workspace'
+              continueOnError: true
+            - checkout: self
+            - ${{ if eq(parameters.buildImages, true) }}:
+              - template: aks-pipeline-langfuse-build.yaml
+                parameters:
+                  acrUrl: $(acrUrl)
+                  containerRegistry: oneformaprestageacr
+                  srcDir: $(srcDir)
+            - ${{ if eq(parameters.deploy, true) }}:
+              - template: aks-pipeline-langfuse-deploy.yaml
+                parameters:
+                  acrUrl: $(acrUrl)
+                  srcDir: $(srcDir)
+                  useBuildTag: ${{ parameters.buildImages }}

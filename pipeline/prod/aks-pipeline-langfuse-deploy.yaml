@@ -1,0 +1,81 @@
+# Render deploy/prod/langfuse.yaml with OneKey project langfuse-prod, point the
+# images this pipeline just pushed at that manifest, then apply.
+# Placeholders stay #{{NAME}}# until `onekey run`.
+# Do not load a Key Vault variable group. OneKey holds the values, and those
+# secrets would be masked anywhere they appear in the log.
+parameters:
+  - name: acrUrl
+    type: string
+  - name: srcDir
+    type: string
+  - name: useBuildTag
+    type: boolean
+    default: true
+
+steps:
+  - task: Bash@3
+    displayName: "PROD AKS Deploy"
+    inputs:
+      targetType: "inline"
+      script: |
+        set -euo pipefail
+        SRC=${{ parameters.srcDir }}
+        ACR=${{ parameters.acrUrl }}
+        TAG=$(Build.BuildNumber)
+        CTX="oneformaprodaks01"
+        # Ask kubectl for this context directly. Piping `get-contexts -o name`
+        # into `grep -q` exits early, and pipefail then reports the context missing
+        # even when it is present and not the last name in the list.
+        if ! kubectl config get-contexts "$CTX" >/dev/null 2>&1; then
+          echo "kubectl context '${CTX}' does not exist on this agent. Available contexts:"
+          kubectl config get-contexts
+          exit 1
+        fi
+        if ! command -v onekey >/dev/null 2>&1; then
+          echo "onekey is not on PATH. Install the OneKey CLI on the prod agent."
+          exit 1
+        fi
+
+        MANIFEST="$(mktemp)"
+        trap 'rm -f "$MANIFEST"' EXIT
+        cp "$SRC/deploy/prod/langfuse.yaml" "$MANIFEST"
+        # useBuildTag is True only when this run built the images.
+        # The manifest keeps the centific_ai prefix; the pushed name does not.
+        if [ "${{ parameters.useBuildTag }}" = "True" ]; then
+          echo "Pointing langfuse-web at ${ACR}/langfuse-web:${TAG}"
+          echo "Pointing langfuse-worker at ${ACR}/langfuse-worker:${TAG}"
+          sed -i \
+            -e "s|oneformaprodacr01.azurecr.io/centific_ai/langfuse-web:[^[:space:]]*|${ACR}/langfuse-web:${TAG}|g" \
+            -e "s|oneformaprodacr01.azurecr.io/centific_ai/langfuse-worker:[^[:space:]]*|${ACR}/langfuse-worker:${TAG}|g" \
+            "$MANIFEST"
+        else
+          WEB_IMAGE=$(kubectl --context "$CTX" -n langfuse get deploy langfuse-web -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+          WORKER_IMAGE=$(kubectl --context "$CTX" -n langfuse get deploy langfuse-worker -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)
+          if [ -z "$WEB_IMAGE" ] || [ -z "$WORKER_IMAGE" ]; then
+            echo "Deploy-only run could not read the running langfuse-web or langfuse-worker image. Refusing to apply the tag stored in the manifest."
+            exit 1
+          fi
+          echo "Deploy only. Keeping running image: ${WEB_IMAGE}"
+          echo "Deploy only. Keeping running image: ${WORKER_IMAGE}"
+          sed -i \
+            -e "s|oneformaprodacr01.azurecr.io/centific_ai/langfuse-web:[^[:space:]]*|${WEB_IMAGE}|g" \
+            -e "s|oneformaprodacr01.azurecr.io/centific_ai/langfuse-worker:[^[:space:]]*|${WORKER_IMAGE}|g" \
+            "$MANIFEST"
+        fi
+
+        onekey run langfuse-prod --template "$MANIFEST" -- \
+          kubectl --context "$CTX" apply -n langfuse -f -
+
+        deadline=$((SECONDS + 900))
+        for r in \
+          deployment/langfuse-web \
+          deployment/langfuse-worker
+        do
+          remaining=$((deadline - SECONDS))
+          if [ "$remaining" -le 0 ]; then
+            echo "timed out waiting for rollouts"
+            kubectl --context "$CTX" -n langfuse get pods
+            exit 1
+          fi
+          kubectl --context "$CTX" -n langfuse rollout status "$r" --timeout="${remaining}s"
+        done

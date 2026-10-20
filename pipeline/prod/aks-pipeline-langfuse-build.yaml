@@ -1,0 +1,45 @@
+# Steps: build and push langfuse-web and langfuse-worker as
+# <acrUrl>/<name>:$(Build.BuildNumber).
+# ClickHouse, Postgres, Redis, and MinIO stay on the versions named in
+# deploy/prod/langfuse.yaml.
+parameters:
+  - name: acrUrl
+    type: string
+  - name: containerRegistry
+    type: string
+  - name: srcDir
+    type: string
+
+steps:
+  - task: Docker@2
+    displayName: Login to ACR
+    inputs:
+      command: login
+      containerRegistry: ${{ parameters.containerRegistry }}
+
+  - task: Bash@3
+    displayName: "Build Images"
+    inputs:
+      targetType: "inline"
+      script: |
+        set -e
+        cd ${{ parameters.srcDir }}
+        T=$(Build.BuildNumber)
+        ACR=${{ parameters.acrUrl }}
+        SHA=$(Build.SourceVersion)
+        docker build -f web/Dockerfile -t $ACR/langfuse-web:$T \
+          --build-arg COMMIT_SHA=$SHA .
+        docker build -f worker/Dockerfile -t $ACR/langfuse-worker:$T \
+          --build-arg COMMIT_SHA=$SHA .
+
+  - task: Bash@3
+    displayName: "Push Images"
+    inputs:
+      targetType: "inline"
+      script: |
+        set -e
+        ACR=${{ parameters.acrUrl }}
+        for i in langfuse-web langfuse-worker; do
+          docker push $ACR/$i:$(Build.BuildNumber)
+          docker rmi $ACR/$i:$(Build.BuildNumber) || true
+        done
